@@ -1,0 +1,783 @@
+---
+title: "Predict Housing Value of Seattle, WA"
+author: "Ziyi Guo, Junyi Yang"
+output:
+  html_document:
+    code_folding: show
+    toc: true
+    toc_float: true
+---
+
+
+```{r setup, include=FALSE}
+
+# You can set some global options for knitting chunks
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load some libraries
+
+library(tidycensus)
+library(tidyverse)
+library(sf)
+library(spdep)
+library(caret)
+library(ckanr)
+library(FNN)
+library(grid)
+library(gridExtra)
+library(ggcorrplot) # plot correlation plot
+library(corrr)      # another way to plot correlation plot
+library(kableExtra)
+library(jtools)     # for regression model plots
+library(ggstance) # to support jtools plots
+library(ggpubr)    # plotting R^2 value on ggplot point scatter
+library(broom.mixed) # needed for effects plots
+library(RColorBrewer)
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+library(spatstat)
+library(corrr)
+
+
+# functions and data directory
+root.dir = "https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/DATA/"
+
+source("https://raw.githubusercontent.com/urbanSpatial/Public-Policy-Analytics-Landing/master/functions.r")
+
+```
+
+To develop a comprehensive predictive model for housing prices in Seattle, we will consider a range of variables that encompass the internal condition of houses, their structural characteristics, spatial location, and available amenities. 
+
+Specifically, our model will take into account the internal condition of houses, including aspects such as interior quality, age of appliances, and recent renovations. Structural characteristics such as property size, number of bedrooms and bathrooms, architectural style, and construction materials will also be included. Additionally, the model will consider the spatial location of properties, including their proximity to key urban centers, waterfront areas, and green spaces. Finally, the availability of local amenities such as schools, hospitals, shop ping centers, public transportation, and recreational facilities will be factored into the model. 
+
+By integrating these diverse variables, our predictive model aims to accurately capture the factors that influence housing prices in Seattle, providing valuable insights for stakeholders in the real estate market.
+
+## 1. Data Wrangling
+
+### 1.1 Access the Data
+
+1. Load the initial housing data and trim it to fit within the boundaries of Seattle city.
+
+```{r get data 1, warning = FALSE, message = FALSE, results='hide'}
+
+# initial housing data
+housingData <- 
+  read.csv(file.path("./dataWithoutcrime/kc_house_data.csv"))
+
+Seattle.sf <- 
+  housingData %>% 
+  st_as_sf(coords = c("long", "lat"), crs = 4326, agr = "constant") %>%
+  st_transform(crs = 2926) %>%
+  mutate(price_per_sqft = price / sqft_lot)
+
+# Seattle geo_Tracts
+tracts <- 
+  st_read("./dataWithoutcrime/2010_Census_Tract_Seattle.geojson") %>%
+  st_transform(crs = 2926)
+
+#Cut the housing data to fit into the Seattle boundary
+Seattle.sf_tracts <- st_intersection(Seattle.sf, tracts)
+
+Seattle.sf_tracts2 <- Seattle.sf_tracts %>%
+  select(id, date, price ,bedrooms, bathrooms, sqft_living, sqft_lot, floors, waterfront, view, condition, grade, yr_built, yr_renovated, zipcode, price_per_sqft, geometry)
+
+```
+
+2. Identify variables that are likely to influence housing values, such as safety metrics, tree canopy coverage, and proximity to transit options. Obtain the relevant data from the Seattle Open Data Portal.
+https://data.seattle.gov/
+https://www.seattle.gov/tech/reports-and-data/open-data
+https://data-seattlecitygis.opendata.arcgis.com/
+
+```{r get data 2, warning = FALSE, message = FALSE, results='hide'}
+
+# Add-in Data
+
+# Seattle neighborhood
+neighborhood <- 
+  st_read("C:/Users/25077/Desktop/MUSA 508_PPA/5_/github/local/seattle-housing/dataWithoutcrime/Neighborhood_Map.geojson") %>%
+  st_transform(crs = 2926)
+
+## social
+crime <- read.csv(file.path("C:/Users/25077/Desktop/PPA_Midterm/SPD_Crime_Data.csv"))
+
+Crime.sf <- 
+  crime %>% 
+  st_as_sf(coords = c("Longitude", "Latitude"), crs = 4326, agr = "constant") %>%
+  st_transform(crs = 2926)
+
+
+## Amenities
+School <- 
+  st_read("./dataWithoutcrime/Private_School.geojson") %>%
+  st_transform(crs = 2926)
+
+Parks <- 
+  st_read("./dataWithoutcrime/seattle-parks-osm.geojson") %>%
+  st_transform(crs = 2926)
+
+Hospital <- 
+  st_read("./dataWithoutcrime/Hospital.geojson") %>%
+  st_transform(crs = 2926)
+
+## Streetcar
+streetcar <- 
+  st_read("C:/Users/25077/Desktop/MUSA 508_PPA/5_/github/local/seattle-housing/dataWithoutcrime/streetcar_3857.geojson") %>%
+  st_transform(crs = 2926)
+
+## Traffic flow
+traffic <- 
+  st_read("C:/Users/25077/Desktop/MUSA 508_PPA/5_/github/local/seattle-housing/dataWithoutcrime/traffic_3857.geojson") %>%
+  st_transform(crs = 2926)
+
+## canopy
+canopy <- 
+  st_read("C:/Users/25077/Desktop/MUSA 508_PPA/5_/github/local/seattle-housing/dataWithoutcrime/tree_3857.geojson") %>%
+  st_transform(crs = 2926)
+
+## Crosswalk
+crosswalk <- 
+  st_read("C:/Users/25077/Desktop/MUSA 508_PPA/5_/github/local/seattle-housing/dataWithoutcrime/Marked_Crosswalks.geojson") %>%
+  st_transform(crs = 2926)
+
+```
+
+3. Convert the spatial character data into variables that may impact housing values, such as the presence of nearby amenities around a particular house and the distance from these amenities to the property. 
+Create buffers around housing locations based on accessible distances. Within these buffers, tally the count of amenities to evaluate the density of local services. Additionally, calculate the distance to the nearest k amenities, providing a granular view of a property's convenience and potential appeal to buyers.
+
+```{r clean data, warning = FALSE, message = FALSE, results='hide'}
+
+# SAFETY
+
+Seattle.sf_tracts2$crime.Buffer <- Seattle.sf_tracts2 %>% 
+    st_buffer(660) %>% 
+    aggregate(dplyr::select(Crime.sf) %>% 
+    mutate(counter = 1), ., sum)
+
+Seattle.sf_tracts2 <-
+  Seattle.sf_tracts2 %>% 
+    mutate(
+      crime_nn1 = nn_function(st_coordinates(Seattle.sf_tracts2), 
+                              st_coordinates(Crime.sf), k = 1),
+      
+      crime_nn2 = nn_function(st_coordinates(Seattle.sf_tracts2), 
+                              st_coordinates(Crime.sf), k = 2), 
+      
+      crime_nn3 = nn_function(st_coordinates(Seattle.sf_tracts2), 
+                              st_coordinates(Crime.sf), k = 3), 
+      
+      crime_nn4 = nn_function(st_coordinates(Seattle.sf_tracts2), 
+                              st_coordinates(Crime.sf), k = 4), 
+      
+      crime_nn5 = nn_function(st_coordinates(Seattle.sf_tracts2), 
+                              st_coordinates(Crime.sf), k = 5)) 
+
+# SCHOOLS
+
+#count the school number within the buffer
+Seattle.sf_tracts2$school.Buffer <- Seattle.sf_tracts2 %>% 
+    st_buffer(5280) %>% 
+    aggregate(dplyr::select(School ) %>% 
+    mutate(counter = 1), ., sum)
+
+Seattle.sf_tracts2 <-
+  Seattle.sf_tracts2 %>% 
+    mutate(
+      school_nn1 = nn_function(st_coordinates(Seattle.sf_tracts2), 
+                              st_coordinates(School), k = 1),
+      )
+
+
+#HOSPITALS
+
+Seattle.sf_tracts2$hosp.Buffer <- Seattle.sf_tracts2 %>% 
+    st_buffer(5280) %>% 
+    aggregate(dplyr::select(Hospital) %>% 
+    mutate(counter = 1), ., sum)
+
+Seattle.sf_tracts2 <-
+  Seattle.sf_tracts2 %>% 
+    mutate(
+      hosp_nn1 = nn_function(st_coordinates(Seattle.sf_tracts2), 
+                              st_coordinates(Hospital), k = 1))
+
+
+# PARKS
+
+Seattle.sf_tracts2$parks.Buffer <- Seattle.sf_tracts2 %>% 
+    st_buffer(1320) %>% 
+    aggregate(dplyr::select(Parks) %>% 
+    mutate(counter = 1), ., sum)
+
+
+# CROSSWALK
+
+Seattle.sf_tracts2$crosswalk.Buffer <- Seattle.sf_tracts2 %>% 
+    st_buffer(1320) %>% 
+    aggregate(dplyr::select(crosswalk) %>% 
+    mutate(counter = 1), ., sum)
+
+
+# STREETCAR STATION
+
+# Streetcar buffer
+streetcar.Buffer <- st_union(st_buffer(streetcar, dist=1000)) 
+
+# Assign to overall dataframe
+Seattle.sf_tracts2$streetcar.station <- st_within(Seattle.sf_tracts2, streetcar.Buffer) %>% lengths > 0
+
+
+# CANOPY
+
+# join canopy to housing points
+Seattle.sf_tracts3 <- st_join(Seattle.sf_tracts2, canopy, left = TRUE)
+
+Seattle.sf_tracts3 <- Seattle.sf_tracts3 %>%
+  st_drop_geometry() %>%
+  select(id, Can_P)
+
+# put the column into the overall dataframe
+Seattle.sf_tracts2$canopy <- Seattle.sf_tracts3["Can_P"]
+
+
+# DISTANCE TO MAJOR ROADS
+
+# Convert Seattle.sf_tracts2 to a point pattern, specifying mark column(s)
+Seattle_points <- as.ppp(Seattle.sf_tracts2)
+
+# Convert traffic to a line segment pattern
+traffic_lines <- as.psp(traffic)
+
+# Find nearest line segment to each point
+nearest_segments <- nncross(Seattle_points, traffic_lines)
+
+# put the column into the overall dataframe
+Seattle.sf_tracts2$distance <- nearest_segments['dist']
+
+
+
+# DEMOGRAPHICS
+
+Demo <- get_acs(geography = "tract", 
+          survey = "acs5",
+          variables = c("B01001_001E", "B01001A_001E", "B06011_001E"), 
+          year = 2018, 
+          state = "53", 
+          county = "033", 
+          geometry = T, 
+          output = "wide") %>%
+  st_transform(crs = 2926) %>%
+  rename(TotalPop = B01001_001E,
+         NumberWhites = B01001A_001E,
+         MedIncome = B06011_001E) %>%
+  mutate(pctWhite = NumberWhites / TotalPop)%>%
+  select(-NAME, -GEOID)
+
+Demo <- st_transform(Demo, st_crs(Seattle.sf_tracts2))
+
+# FINALIZE
+
+#Join the demographics data
+#Clean the data
+
+Seattle.sf_tracts2 <- st_join(Seattle.sf_tracts2, Demo, left = TRUE)
+Seattle.sf_tracts2 <- Seattle.sf_tracts2 %>%
+  select(-contains("B01"), -contains("B06"))%>%
+  mutate(Age = 2024 - yr_built, parksCount = parks.Buffer$counter, crimeCount=crime.Buffer$counter, schoolCount=school.Buffer$counter, hospitalCount=hosp.Buffer$counter, crosswalkCount=crosswalk.Buffer$counter, canopyPercent=canopy$Can_P, TrafficDis=distance$dist) 
+
+
+```
+
+### 1.2 Summarize and Preview the Variables
+
+Categorize the collected and initial data, and provide a summary of the statistics.
+
+```{r preview the data, warning = FALSE, message = FALSE}
+
+## delete the geometry column
+table_Seattle <- Seattle.sf_tracts2 %>% st_drop_geometry()
+
+#category of the data
+
+#internal_character
+internal_character_df <- table_Seattle[, c("bedrooms", "bathrooms", "sqft_living","sqft_lot", "floors", "condition", "grade")]
+internal_character <- round(do.call(cbind, lapply(internal_character_df, summary)), digits = 2)
+
+#Structure_character
+Structure_character_df <- table_Seattle[, c("condition", "grade", "Age", "yr_renovated")]
+Structure_character <- round(do.call(cbind, lapply(Structure_character_df, summary)), digits = 2)
+
+#amenities
+amenities_df <- table_Seattle[, c("parksCount", "schoolCount", "hospitalCount", "crosswalkCount", "canopyPercent", "hosp_nn1", "school_nn1")]
+amenities <- round(do.call(cbind, lapply(amenities_df, summary))[1:6,], digits = 2)
+
+#distance column for some reason need to be calculated separatly
+distance_extract_df <- table_Seattle[, c("distance")]
+distance_extract <- round(do.call(cbind, lapply(distance_extract_df, summary)), digits = 2)
+
+amenities_all <- cbind(amenities, distance_extract)
+
+
+#spatial_character
+spatial_character_df <- table_Seattle[, c( "waterfront", "view")]
+spatial_character <- round(do.call(cbind, lapply(spatial_character_df, summary)), digits = 2)
+
+#safety
+safety_df <- table_Seattle[, c( "crime_nn1","crime_nn2","crime_nn3","crime_nn4","crime_nn5", "crimeCount")]
+safety <- round(do.call(cbind, lapply(safety_df, summary)), digits = 2)
+
+#Demographics
+Demographics_df <- table_Seattle[, c( "TotalPop", "MedIncome", "pctWhite")]
+Demographics <- round(do.call(cbind, lapply(Demographics_df, summary))[1:6,], digits = 2)
+
+
+# Combine the summaries into one data frame
+summary_data <- cbind(internal_character, Structure_character, amenities_all, 
+                      spatial_character, safety, Demographics)
+
+long_summary_data <- as.data.frame(t(summary_data)) %>%
+  rename('Minimum' = 'Min.',
+         '1st Quantile' = '1st Qu.',
+         '3rd Quantile' = '3rd Qu.',
+         'Maximun' = 'Max.')
+
+#generate table
+kb <- kbl(long_summary_data, caption = "Statistics Summary") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  pack_rows("Internal Character", 1, 7) %>%
+  pack_rows("Structure Character", 8, 11) %>%
+  pack_rows("Amenities", 12, 19) %>%
+  pack_rows("Spatial character", 20, 21) %>%
+  pack_rows("Safety", 22, 27) %>%
+  pack_rows("Demographics", 28, 30)
+
+kb
+
+```
+
+Based on the initial housing datasets, we have incorporated additional spatially-oriented data related to amenities and safety. The overall data can now be categorized into several key areas:
+
+Internal Characteristics: This includes features such as the number of bedrooms and the grade of the property.
+Structural Characteristics: These are aspects related to the condition, age, and structural features of the property.
+Amenities: This category covers the proximity and accessibility of essential services such as hospitals and schools.
+Traffic Accessibility: This includes factors such as the presence of crosswalks and the distance to major roads.
+Spatial Characteristics: These are features related to the property's location, such as waterfront views.
+Safety and Demographic Issues: This category encompasses data related to the safety of the area and demographic characteristics of the surrounding community.
+
+These enhancements to the dataset provide a more comprehensive understanding of the housing market, taking into account a wider range of factors that can influence property values and desirability.
+
+
+### 1.3 Variable Maps
+1. Housing Price Map
+
+```{r Housing Price map, warning = FALSE, message = FALSE, results='hide'}
+
+## Current housing price map
+Seattle.sf_tracts2$quintiles <- ntile(Seattle.sf_tracts2$price, 5)
+
+# Convert quintiles to a factor if not already done
+Seattle.sf_tracts2$quintiles <- as.factor(Seattle.sf_tracts2$quintiles)
+Palette5 <- brewer.pal(5, "YlGnBu")
+
+# Generate the plot
+ggplot() +
+  geom_sf(data = tracts, fill = "lightgrey", col = "white") +
+  geom_sf(data = Seattle.sf_tracts2, aes(colour = quintiles), show.legend = "point", size = .25) +
+  scale_colour_manual(values = Palette5,
+                      labels = c("Low", "Relatively Low", "Medium", "Relatively High", "High"),
+                      name = "Price Per Square Foot Quintiles") +
+  labs(title = "Price Per Square Foot, Seattle") +
+  theme_void()
+```
+
+2. Streetcar Station and Service Area Map
+
+```{r Steetcar Station and Service Area map, warning = FALSE, message = FALSE, results='hide'}
+## Street Car Station and Buffer
+ggplot() +
+  geom_sf(data = tracts, fill = "lightgrey", col = "white") +
+  geom_sf(data = streetcar.Buffer, fill = "cyan4", col = "white", alpha = 0.5) +
+  geom_sf(data = streetcar, col = "black", show.legend = "point", size = .25) +  
+  labs(title = "Streetcar Station and Service Area") +
+  theme_void()
+```
+
+3. Hospital Distribution Map
+
+```{r Hospital map, warning = FALSE, message = FALSE, results='hide'}
+## Hospital
+Hospital_clipped <- st_intersection(Hospital, tracts)
+ggplot() +
+  geom_sf(data = tracts, fill = "lightgrey", col = "white") +
+  geom_sf(data = Hospital_clipped, size =1, color = "indianred2") +
+  labs(title = "Hospital") +
+  theme_void()
+```
+
+
+4. Median Income Map
+
+```{r selected variables map, warning = FALSE, message = FALSE, results='hide'}
+## MedIncome
+Demo_clipped <- st_intersection(Demo, tracts)
+ggplot(data = Demo_clipped) +
+  geom_sf(aes(fill = MedIncome),color = "oldlace", size=0.1) +  # Use MedIncome for the fill color
+  scale_fill_gradient(low = "oldlace", high = "skyblue4", 
+                      name = "Median Income") +  # Adjust color gradient as needed
+  labs(title = "Median Income by Census Tract",
+       subtitle = "Seattle, WA") +
+    theme_void()
+
+```
+
+
+## 2. Analysis Variables
+
+### 2.1 Analyzing associations
+
+```{r Correlation, fig.height=7, fig.width=10,warning = FALSE, message = FALSE, results='hide'}
+
+# Remove geometry column (if present), calculate Age, and select relevant variables
+Seattle <- st_drop_geometry(Seattle.sf_tracts2) %>%
+  select(price, sqft_living, Age, crimeCount, schoolCount) %>%
+  filter(Age < 500)
+ 
+
+Seattle_long <- gather(Seattle, Variable, Value, -price)
+
+# Create scatterplot with linear regression lines for each variable
+ggplot(Seattle_long, aes(Value, price)) + 
+  geom_point(size = .5) +
+  geom_smooth(method = "lm", se = FALSE, colour = "indianred3") +
+  facet_wrap(~Variable, ncol = 2, scales = "free") + 
+  labs(title = "Price as a function of continuous variables") + 
+  theme_minimal()
+
+```
+
+The age of a property seems to have a nebulous effect on its price, as depicted by the scatter plot with points broadly dispersed, revealing no discernible trend. This ambiguity could be due to factors like renovations, historical value, or location that can offset the impact of age.
+
+In contrast, the plot for crime count indicates a trend where an increase in crime correlates with a decline in housing prices. The nature of this relationship is complex, not strictly linear, potentially reflecting a threshold beyond which crime significantly deters buyers, or it may point to other socioeconomic factors at play in higher crime neighborhoods that also affect property values.
+
+For school count, there is a suggestion of a positive correlation with housing prices, albeit a very mild one. This could be due to the perceived value of educational accessibility, though the weak trend indicates that it may not be a primary consideration for buyers in this market, or that other location-related characteristics may have a more substantial impact on price.
+
+Square footage of living space displays a strong positive correlation with housing prices, underscoring a clear preference for larger living spaces. This trend is intuitive, as more space typically translates to a higher price, reflecting the demand for larger homes which often command premium prices due to the added utility and comfort they provide.
+
+
+### 2.2 Correlation Matrix
+
+Construct a pairwise correlation matrix for all variables in our dataset, including the target variable "price," to analyze their relationships with housing prices. This analysis will guide our selection of predictive modeling features and help identify instances of multicollinearity.
+
+```{r fig.height=10, fig.width=10,warning = FALSE, message = FALSE, results='hide'}
+
+# Select only numeric variables and remove rows with missing values
+numericVars <- Seattle.sf_tracts2 %>%
+  st_drop_geometry() %>%  # Remove geometry column if present
+  select_if(is.numeric) %>%  # Select only numeric variables
+  na.omit()  # Remove rows with missing values
+
+# Calculate correlation matrix
+correlation_matrix <- cor(numericVars)
+
+numericVars %>%
+  correlate() %>%
+  autoplot() +
+  geom_text(aes(label = round(r, digits=2)), size = 2) +
+  labs(title = "Correlation across Numeric Variables")
+
+
+
+```
+
+Based on the correlation analysis chart, housing prices show a more positive association with the property's grade, number of bathrooms, the percentage of the white population, median income, and canopy coverage. Additionally, we have identified potential multicollinearity among a few variables. For instance, the distances to the nearest 1-5 crime spots are highly positively correlated, as are the percentage of the white population and high income, and the house's grade with the living area. To ensure the validity of our predictive model, we will address these multicollinearity concerns by carefully selecting variables to avoid including these highly correlated predictors simultaneously in the model-building phase.
+
+## 3. Model Development
+
+### 3.1 Baseline Model
+
+have baseline model 0, take all variables into consideration, and show the model resultes
+```{r Baseline model 0,warning = FALSE, message = FALSE, results='hide'}
+
+##Baseline Model Reg0
+Seattle_final_0 <- st_drop_geometry(Seattle.sf_tracts2)%>%
+  select(-contains("Buffer"), -contains("distance"), -contains("date"), -yr_built, -canopy, -quintiles)%>% 
+  filter(price <= 2000000) 
+
+reg0 <- lm(price ~ ., data = Seattle_final_0)
+
+summary(reg0)
+
+```
+
+### 3.2 Finalized Model
+Based on the baseline model outcomes, identify and remove variables that exhibit high multicollinearity, as well as those that lack statistical significance, to refine and establish Model 1.
+
+```{r finalized model 1, warning = FALSE, message = FALSE}
+
+## Finalized Model Reg1
+# Select Varibles
+Seattle_final <- Seattle_final_0 %>%
+  select(id, Age, price, bedrooms, bathrooms, sqft_living, waterfront, view, condition, grade,
+         crimeCount, hosp_nn1, schoolCount, canopyPercent, parksCount, crosswalkCount, TrafficDis,
+         pctWhite, MedIncome)%>%
+  mutate_all(~replace(., is.na(.), 0))
+
+reg1 <- lm(price ~ ., data = Seattle_final)
+
+summary1 <- summary(reg1)
+
+## Kable show summary of the model Reg1
+coef_table <- as.data.frame(summary1$coefficients)
+coef_table$significance <- ifelse(coef_table$`Pr(>|t|)` < 0.001, '***',
+                                    ifelse(coef_table$`Pr(>|t|)` < 0.01, '**',
+                                      ifelse(coef_table$`Pr(>|t|)` < 0.05, '*',
+                                        ifelse(coef_table$`Pr(>|t|)` < 0.1, '.', ''))))
+coef_table$p_value <- paste0(round(coef_table$`Pr(>|t|)`, digits = 3), coef_table$significance)
+coef_table$'t value' <- round(coef_table$'t value', digits = 2)
+coef_table$'Std. Error' <- round(coef_table$'Std. Error', digits = 2)
+coef_table$Estimate <- round(coef_table$Estimate, digits = 2)
+
+coef_table %>%
+  select( -significance, -`Pr(>|t|)`) %>% 
+  kable(align = "r") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  footnote(general_title = "\n", general = "Table x")
+
+## Results of the model
+model_summary1 <- data.frame(
+  Statistic = c("Multiple R-squared", "Adjusted R-squared", "F-statistic"),
+  Value = c(
+    summary1$r.squared,
+    summary1$adj.r.squared,
+    summary1$fstatistic[1]
+  )
+)
+model_summary1 %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+```
+
+An R-squared value of 0.76 suggests that approximately 76% of the variation in the housing price can be explained by the independent variables included in the model. This indicates a relatively strong relationship between the predictors and the response variable. 
+
+## 4. Model Diagnose:
+
+Validating the predictive model requires a multifaceted approach to ensure its reliability and accuracy. This process should include a thorough examination of the variables to confirm their relevance and influence on the outcome. Residual analysis is crucial to identify any systematic deviations between predicted and actual values. Cross-validation techniques are essential for assessing the model's performance across different data subsets, thereby ensuring its generalizability. Additionally, analyzing error distribution maps, like the one provided for the MAPE across neighborhoods, offers geographical insights into the model's predictive behavior. Finally, quantifying the model's precision through error metrics such as Root Mean Squared Error (RMSE) and Mean Absolute Error (MAE) provides a clear indication of the average magnitude of the model's prediction errors. Together, these validation steps form a comprehensive framework to fine-tune the model for enhanced predictive performance.
+
+### 4.1 Plot Coefficients:
+
+```{r,warning = FALSE, message = FALSE, results='hide'}
+## Plot coefficients
+plot_summs(reg1, scale = TRUE)
+
+## plot multiple model coeffs, use another model for comparison.
+plot_summs(reg1, reg0)
+
+```
+
+
+Most variables, such as the age of the house, the number of bathrooms, and the number of crosswalks near the house, indicate a positive correlation. This suggests that, generally, a higher number of bathrooms in a house is associated with a higher housing value. Conversely, the variable 'crime' shows the opposite trend; more crime reports near a house are associated with a lower housing value. Among the variables with positive relationships, the 'waterfront' variable has a much higher coefficient. As 'waterfront' is a binary variable consisting of only "0" and "1," this suggests that houses near the waterfront are, on average, $369,747 more expensive than houses not near the waterfront.
+
+
+### 4.2 Residual Examination
+
+```{r,warning = FALSE, message = FALSE, results='hide'}
+residuals_df <- data.frame(Residuals = resid(reg1), Fitted = fitted(reg1))
+ggplot(residuals_df, aes(x = Fitted, y = Residuals)) +
+  geom_point(size = 0.25, color = "black") +
+  geom_hline(yintercept = 0, color = "indianred1", size=0.8) +
+  labs(title = "Residual Plot for Regression",
+       subtitle = "Each dot represent one property ",
+       x = "Fitted Values",
+       y = "Residuals") +
+  theme_light() +   
+  theme(plot.subtitle = element_text(size = 9,face = "italic"),
+        plot.title = element_text(size = 12, face = "bold"), 
+        axis.text.x=element_text(size=6),
+        axis.text.y=element_text(size=6), 
+        axis.title=element_text(size=8))
+```
+The residual plot offers a valuable visual representation of the model's current performance, revealing the differences between the observed and predicted values. While the residuals predominantly cluster around the zero line—a promising sign—the pattern of increased spread with higher fitted values points to an opportunity for enhancing the model's consistency. This phenomenon, known as heteroscedasticity, indicates that our model's accuracy fluctuates with the value scale. To improve future predictions, we might consider exploring data transformations or more robust regression techniques that could stabilize the variance across the spectrum of predictions. Additionally, addressing the outliers that stand apart from the main cluster could refine the model's accuracy.
+
+
+### 4.3 Training and Testing Datasets
+
+```{r traintest,warning = FALSE, message = FALSE, results='hide'}
+
+# Split the dataset into a training set and a test set using stratified sampling
+inTrain <- createDataPartition(
+              y = paste(Seattle_final$sqft_lot, Seattle_final$view, 
+                        Seattle_final$yr_built, Seattle_final$school_nn1), 
+              p = .60, list = FALSE)  # Create a vector of indices for the training set
+
+# Subset the dataset to create the training set
+Seattle.training <- Seattle_final[inTrain,]  # Training set
+# Subset the dataset to create the test set
+Seattle.test <- Seattle_final[-inTrain,]     # Test set
+ 
+# Fit a linear regression model to predict Sales Price using selected predictors
+reg.training <- 
+  lm(price ~ ., data = as.data.frame(Seattle.training))
+
+summary(reg.training)
+
+
+# Make predictions on the test set and evaluate model performance
+
+Seattle.test <-
+  Seattle.test %>%  # Pipe the test set into the following operations
+  # Add a column indicating the type of regression model used
+  mutate(Regression = "Baseline Regression",
+         # Predict sale prices using the trained regression model
+         SalePrice.Predict = predict(reg.training, Seattle.test),
+         # Calculate the difference between predicted and actual sale prices
+         SalePrice.Error = SalePrice.Predict - price,
+         # Calculate the absolute difference between predicted and actual sale prices
+         SalePrice.AbsError = abs(SalePrice.Predict - price),
+         # Calculate the absolute percentage error
+         SalePrice.APE = (abs(SalePrice.Predict - price)) / price) %>%
+  filter(price < 5000000)  # Filter out records with SalePrice greater than $5,000,000
+
+# MAE and MAPE
+MAE <- mean(Seattle.test$SalePrice.AbsError, na.rm = T)
+
+MAPE <- mean(Seattle.test$SalePrice.APE, na.rm = T)
+
+error_metrics <- data.frame(
+  Metric = c("MAE", "MAPE"),
+  Value = c(MAE, MAPE)
+)
+
+```
+
+The error metrics provided for the model are the Mean Absolute Error (MAE) and the Mean Absolute Percentage Error (MAPE). The MAE is approximately 94,712, and the MAPE is about 18.35%. These values offer insights into the model's performance:
+
+MAE  represents the average absolute difference between the observed actual outcomes and the predictions made by the model. An MAE of 94,712 suggests that, on average, the model's predictions are about $94,712 away from the actual housing value.
+
+MAPE shows the average absolute percent error between the observed actual outcomes and the model's predictions. A MAPE of 18.35% indicates that the model's predictions are off by 18.35% on average.
+
+
+
+### 4.4 Cross Validation
+
+```{r cv,warning = FALSE, message = FALSE, results='hide'}
+# Load necessary libraries
+
+# Define the control parameters for k-fold cross-validation
+control <- trainControl(method = "cv",    # Use k-fold cross-validation
+                        number = 10,      # Number of folds
+                        verboseIter = TRUE,  # Show verbose output
+                        returnData = FALSE,  # Don't return resampled data
+                        savePredictions = TRUE,  # Save predictions
+                        classProbs = FALSE,  # Don't compute class probabilities
+                        summaryFunction = defaultSummary)  # Use default summary function
+
+# Train the linear regression model using k-fold cross-validation
+lm_cv <- train(price ~ .,  # Formula for the linear regression model
+               data = Seattle_final,  # Dataset
+               method = "lm",           # Specify "lm" for linear regression
+               trControl = control)     # Use the defined control parameters
+
+# View the cross-validation results
+print(lm_cv)
+
+
+# Plot observed versus predicted values
+plot(lm_cv$pred$obs, lm_cv$pred$pred, 
+     xlab = "Observed", ylab = "Predicted", 
+     main = "Observed vs Predicted Values") +
+     abline(0, 1, col = "indianred1", size=0.8)
+
+
+```
+The scatter plot of observed versus predicted values reveals that the regression model performs well at lower value ranges, as indicated by the clustering of points near the diagonal line where predictions match the observed values closely. However, as we move towards higher observed values, the points disperse more widely from the diagonal, suggesting the model's predictive accuracy decreases in this higher range. Additionally, several points significantly stray from the diagonal, particularly at the upper end, suggesting potential outliers. Improving the model may involve investigating the causes of less accurate predictions at higher values, addressing outliers, adjusting model complexity, or exploring non-linear relationships.
+
+
+### 4.5 Distribution of Sale Price Error Testing Set
+
+```{r,warning = FALSE, message = FALSE, results='hide'}
+
+Seattle.test_join <- left_join(Seattle.test, housingData, join_by(id == id))
+Seattle.test_withgeo <- 
+  Seattle.test_join %>% 
+  st_as_sf(coords = c("long", "lat"), crs = 4326, agr = "constant") %>%
+  st_transform(crs = 2926)
+
+Seattle.test_withgeo$SalePrice.Error <- round(Seattle.test_withgeo$SalePrice.Error, digits = 2)
+
+ggplot()+
+  geom_sf(data = tracts, fill = "lightgrey", col = "white") +
+  geom_sf(data=Seattle.test_withgeo, aes(colour = Seattle.test_withgeo$SalePrice.Error), size=0.3)+
+  scale_color_continuous(low = "skyblue2", high = "indianred2", name= "Sale Price Error ") +
+  labs(title = "Distribution of Sale Price Error Testing Set") +
+  theme_void()
+```
+The map visualizes the distribution of sale price prediction errors across Seattle. The predominance of red hues across the map suggests that, in many areas, the model overestimated the sale prices. The degree of error varies, with some regions showing a higher overestimation than others, as indicated by the intensity of the red color. On the other hand, blue areas where the model underpredicted prices are less common and less intensely colored, suggesting fewer instances and lower magnitudes of underestimation.
+
+### 4.6 Mean Absolute Percentage Error By Neighborhood
+
+```{r,warning = FALSE, message = FALSE, results='hide'}
+to_plot <- st_intersection(Seattle.test_withgeo, neighborhood %>% dplyr::select("S_HOOD")) %>% 
+  st_drop_geometry() %>% 
+  group_by(S_HOOD) %>%
+  summarise(mean.MAPE = mean(SalePrice.APE, na.rm = T)) %>% 
+  left_join(neighborhood) %>% 
+  st_sf()
+to_plot %>%
+  ggplot() + 
+      geom_sf(aes(fill = mean.MAPE), color="oldlace") +
+  scale_fill_continuous(low = "lightblue2", high = "indianred3", name= "MAPE") +
+  theme(
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        plot.title = element_text(size = 12, face = "bold"),
+        panel.background = element_blank(),
+        panel.border = element_rect(colour = "grey", fill=NA, size=0.4)
+        ) +
+  labs(title = "Mean Absolute Percentage Error By Neighborhood") 
+
+```
+
+
+This map presents the Mean Absolute Percentage Error (MAPE) for a housing value prediction model, offering insight into its performance across various neighborhoods. The map reveals a non-uniform predictive accuracy; notably, neighborhoods like Rainier Beach, South Park, and Highland Park exhibit higher errors, indicating the model’s predictions are notably less precise here. 
+
+When cross-referenced with the south price error map, it becomes clear that these southeastern areas have been consistently overvalued by the model. This overestimation could stem from several factors. For instance, it might indicate that certain influential variables, which could depress housing values in these neighborhoods, are not adequately represented in the model. Such variables might include local economic conditions, crime rates, environmental issues, or access to key amenities. 
+
+Moreover, this discrepancy may highlight the need for more nuanced, area-specific data that captures the microeconomic conditions of these neighborhoods. By integrating more granular data and refining the model to account for localized influences, the predictive accuracy could be markedly improved.
+
+### 4.7 RMSE, MAE
+
+
+```{r loocv,warning = FALSE, message = FALSE, results='hide'}
+# Set up leave-one-out cross-validation
+control <- trainControl(method = "LOOCV",     # Use leave-one-out cross-validation
+                        number = nrow(Seattle_final),  # Number of folds = number of observations
+                        verboseIter = TRUE,  # Show verbose output
+                        returnData = FALSE,  # Don't return resampled data
+                        savePredictions = TRUE,  # Save predictions
+                        classProbs = FALSE,  # Don't compute class probabilities
+                        summaryFunction = defaultSummary)  # Use default summary function
+
+# Train the linear regression model using leave-one-out cross-validation
+lm_loocv <- train(price ~ .,  # Formula for the linear regression model
+                  data = Seattle_final,  # Dataset
+                  method = "lm",           # Specify "lm" for linear regression
+                  trControl = control)     # Use the defined control parameters
+
+
+# 6669 fold in total
+```
+
+```{r loocv2,warning = FALSE, message = FALSE}
+# View the cross-validation results
+loocv_results <- lm_loocv['results']
+statistic_summary <- do.call(rbind, loocv_results) %>% select(-contains("intercept"))
+
+
+kbl(statistic_summary) %>%
+  kable_styling(bootstrap_options = "striped", full_width = T, position = "left")
+
+```
+The Root Mean Square Error (RMSE) of approximately 134,736 for the Seattle housing value prediction model indicates the standard deviation of the prediction errors, which means that typically, the model's predictions deviate from the actual values by this amount. In the context of Seattle's real estate market, where housing values can vary greatly, this RMSE might suggest that while the model is useful, its predictions are not consistently close to actual sale prices. The R-squared value indicates that 76% of the variability in housing prices is explained by the model, which is a positive sign of fit, but it doesn't necessarily guarantee accuracy on individual predictions. Additionally, the Mean Absolute Error (MAE) of around 95,819 suggests that the model's average prediction error is within this range, providing further insight into the model's performance. The relatively high RMSE compared to the MAE suggests there might be some large deviations for certain predictions, potentially pointing towards outliers or instances where the model fails to capture the underlying value drivers. It would be beneficial to delve into the specific areas where the model overshoots or undershoots to fine-tune its predictive capabilities.
